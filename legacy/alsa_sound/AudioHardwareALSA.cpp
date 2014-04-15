@@ -105,6 +105,11 @@ AudioHardwareInterface *AudioHardwareALSA::create() {
 AudioHardwareALSA::AudioHardwareALSA() :
     mALSADevice(0),mVoipInStreamCount(0),mVoipOutStreamCount(0),mVoipMicMute(false),
     mVoipBitRate(0),mCallState(CALL_INACTIVE),mAcdbHandle(NULL),mCsdHandle(NULL),mMicMute(0)
+
+#ifdef USE_ES310
+    ,mAudienceCodecInit(0)
+#endif
+
 {
     FILE *fp;
     char soundCardInfo[200];
@@ -157,7 +162,12 @@ AudioHardwareALSA::AudioHardwareALSA() :
     acdb_deallocate = NULL;
 #endif
 
+#ifdef USE_ES310
+    mALSADevice = new ALSADevice(this);
+#else
     mALSADevice = new ALSADevice();
+#endif
+
     if (!mALSADevice) {
         mStatus = NO_INIT;
         return;
@@ -353,6 +363,16 @@ AudioHardwareALSA::AudioHardwareALSA() :
         }
     }
 
+#ifdef USE_ES310
+    mLoopbackState = 0;
+    ALOGE("doAudienceCodec_Init+");
+    if (mAudienceCodecInit == 0) {
+        Mutex::Autolock lock(mAudioCodecLock);
+        doAudienceCodec_Init();
+    }
+    ALOGE("doAudienceCodec_Init-");
+#endif
+
     //set default AudioParameters
     AudioParameter param;
     String8 key;
@@ -399,6 +419,11 @@ AudioHardwareALSA::AudioHardwareALSA() :
 
 AudioHardwareALSA::~AudioHardwareALSA()
 {
+
+#ifdef USE_ES310
+    doAudienceCodec_DeInit();
+#endif
+
     if (mUcMgr != NULL) {
         ALOGV("closing ucm instance: %u", (unsigned)mUcMgr);
         snd_use_case_mgr_close(mUcMgr);
@@ -498,13 +523,40 @@ status_t AudioHardwareALSA::setMode(int mode)
 {
     status_t status = NO_ERROR;
 
+#ifdef USE_ES310
+    if ((mMode == AUDIO_MODE_RINGTONE) &&
+        (mode == AUDIO_MODE_NORMAL)) {
+        enableAudienceloopback(0);
+        doRouting_Audience_Codec( 0, 0, false);
+    }
+#endif
+
     ALOGV("%s() mode=%d mMode=%d", __func__, mode, mMode);
 
     if (mode != mMode) {
         status = AudioHardwareBase::setMode(mode);
     }
 
+#ifdef USE_ES310
+    if (mode == AUDIO_MODE_RINGTONE) {
+        if (mAudienceCmd == CMD_AUDIENCE_READY)
+        {
+            mAudienceCmd = CMD_AUDIENCE_WAKEUP;
+            pthread_cond_signal(&mAudienceCV);
+        }
+    }
+#endif
+
     if (mode == AUDIO_MODE_IN_CALL) {
+
+#ifdef USE_ES310
+        if (mAudienceCmd == CMD_AUDIENCE_READY)
+        {
+            mAudienceCmd = CMD_AUDIENCE_WAKEUP;
+            pthread_cond_signal(&mAudienceCV);
+        }
+#endif
+
         if (mCallState <= CALL_INACTIVE) {
 #ifndef QCOM_MULTI_VOICE_SESSION_ENABLED
             ALOGV("%s() defaulting vsid and call state",__func__);
@@ -1041,6 +1093,14 @@ status_t AudioHardwareALSA::doRouting(int device, char* useCase)
        newMode = AudioSystem::MODE_IN_CALL;
     }
     if (!isRouted) {
+
+#ifdef TAURUS
+        if (mMode == AudioSystem::MODE_IN_COMMUNICATION) {
+            ALOGE("MSM8960 - FENS enable");
+            mALSADevice->enableFENS(true);
+        }
+#endif
+
 #ifdef QCOM_USBAUDIO_ENABLED
         if(!(device & AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET) &&
             !(device & AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET) &&
@@ -1814,6 +1874,17 @@ AudioHardwareALSA::openInputStream(uint32_t devices,
         alsa_handle.ucMgr = mUcMgr;
         snd_use_case_get(mUcMgr, "_verb", (const char **)&use_case);
 
+#ifdef USE_ES310
+        for(it = mDeviceList.begin();
+            it != mDeviceList.end(); ++it) {
+                if((!strcmp(it->useCase, SND_USE_CASE_VERB_HIFI_REC)) ||
+                   (!strcmp(it->useCase, SND_USE_CASE_MOD_CAPTURE_MUSIC))) {
+                    ALOGE("error:Input stream already opened for recording");
+                    return in;
+                }
+        }
+#endif
+
         if ((use_case != NULL) && (strcmp(use_case, SND_USE_CASE_VERB_INACTIVE))) {
             if ((devices == AudioSystem::DEVICE_IN_VOICE_CALL) &&
                 (newMode == AUDIO_MODE_IN_CALL)) {
@@ -2032,6 +2103,798 @@ AudioHardwareALSA::closeInputStream(AudioStreamIn* in)
 {
     delete in;
 }
+
+#ifdef USE_ES310
+#define BUFSIZE_UART 1024
+#define VOICEPROC_MAX_FW_SIZE	(32 * 4096)
+
+static ES310_PathID dwOldPath = ES310_PATH_SUSPEND;
+static ES310_PathID dwNewPath = ES310_PATH_SUSPEND;
+static int AudiencePrevMode = AudioSystem::MODE_NORMAL;
+static unsigned int dwOldPreset = -1;
+static unsigned int dwNewPreset = -1;
+
+//Call this API after enabling the Audience, Also call this API before disabling the Audience
+void AudioHardwareALSA::enableAudienceloopback(int enable)
+{
+    if (mAudienceCodecInit != 1) {
+        ALOGE("Audience Codec not initialized.\n");
+        return;
+    }
+
+    if (mLoopbackState == enable)
+        return;
+
+    ALOGV("enableAudienceloopback enable:%d", enable);
+    if(enable ==1 ) {
+        mALSADevice->setMixerControl("IIR1 INP1 MUX", "DEC2");
+    }
+    else {
+        mALSADevice->setMixerControl("RX1 Digital Volume",1,0);
+        mALSADevice->setMixerControl("RX2 Digital Volume",1,0);
+        mALSADevice->setMixerControl("RX3 Digital Volume",1,0);
+        mALSADevice->setMixerControl("RX4 Digital Volume",1,0);
+        mALSADevice->setMixerControl("IIR1 INP1 MUX", "ZERO");
+    }
+
+    mLoopbackState = enable;
+}
+
+static void setHigherBaudrate(int uart_fd, int baud)
+{
+	struct termios2 ti2;
+       struct termios ti;
+	/* Flush non-transmitted output data,
+	 * non-read input data or both
+	 */
+	tcflush(uart_fd, TCIFLUSH);
+
+	/* Set the UART flow control */
+
+	ti.c_cflag |= 1;
+
+	/* ti.c_cflag |= (CLOCAL | CREAD | CSTOPB); */
+	/*	ti.c_cflag &= ~(CRTSCTS | PARENB); */
+
+	/*
+	 * Enable the receiver and set local mode + 2 STOP bits
+	 */
+	ti.c_cflag |= (CLOCAL | CREAD | CSTOPB);
+	/* 8 data bits */
+	ti.c_cflag &= ~CSIZE;
+	ti.c_cflag |= CS8;
+	/* diable HW flow control and parity check */
+	ti.c_cflag &= ~(CRTSCTS | PARENB);
+
+	/* choose raw input */
+	ti.c_lflag &= ~(ICANON | ECHO);
+	/* choose raw output */
+	ti.c_oflag &= ~OPOST;
+	/* ignore break condition, CR and parity error */
+	ti.c_iflag |= (IGNBRK | IGNPAR);
+	ti.c_iflag &= ~(IXON | IXOFF | IXANY);
+	ti.c_cc[VMIN] = 0;
+	ti.c_cc[VTIME] = 10;
+
+	/*
+	 * Set the parameters associated with the UART
+	 * The change will occur immediately by using TCSANOW
+	 */
+	if (tcsetattr(uart_fd, TCSANOW, &ti) < 0) {
+		printf("Can't set port settings\n");
+		return;
+	}
+
+	tcflush(uart_fd, TCIFLUSH);
+
+	/* Set the actual baud rate */
+	ioctl(uart_fd, TCGETS2, &ti2);
+	ti2.c_cflag &= ~CBAUD;
+	ti2.c_cflag |= BOTHER;
+	ti2.c_ospeed = baud;
+	ti2.c_ispeed = baud;
+	ioctl(uart_fd, TCSETS2, &ti2);
+}
+
+int sendDownloadCmd(int uart_fd)
+{
+	unsigned char respBuffer = 0xcc, tmp;
+	int nretry = 10, rc;
+	int BytesWritten, readCnt;
+
+	tmp = 0x00;
+	BytesWritten = write(uart_fd, &tmp, 1);
+	if (BytesWritten == -1)
+		ALOGE("error writing synccmd to comm port: %s\n", strerror(errno));
+	else
+		ALOGE("Uart_write BytesWritten = %i\n", BytesWritten);
+
+	usleep(1000);
+	readCnt = read(uart_fd, &respBuffer, 1);
+	if (readCnt == -1)
+		ALOGE("error reading bootcmd from comm port: %s\n", strerror(errno));
+	else
+		ALOGE("readCnt = %d, respBuffer = %.2x\n", readCnt, respBuffer);
+	usleep(1000);
+
+	tmp = 0x01;
+	BytesWritten = write(uart_fd, &tmp, 1);
+	if (BytesWritten == -1)
+		ALOGE("error writing bootcmd to comm port: %s\n", strerror(errno));
+	else
+		ALOGE("Uart_write BytesWritten = %i\n", BytesWritten);
+
+	usleep(1000);
+	readCnt = read(uart_fd, &respBuffer, 1);
+	if (readCnt == -1)
+		ALOGE("error reading bootcmd from comm port: %s\n", strerror(errno));
+	else
+		ALOGE("readCnt = %d, respBuffer = %.2x\n", readCnt, respBuffer);
+
+	if (respBuffer == 1)
+		return 0;
+
+	return -1;
+}
+
+int uartSendBinaryFile(int uart_fd, const char* img)
+{
+	int ret = -1, write_size;
+	int i = 0;
+	ALOGE("voiceproc_uart_sendImg %s\n", img);
+	struct voiceproc_img fwimg;
+	char char_tmp = 0;
+	unsigned char local_vpimg_buf[VOICEPROC_MAX_FW_SIZE], *ptr = local_vpimg_buf;
+	int rc = 0, fw_fd = -1;
+	ssize_t nr;
+	size_t remaining;
+	struct stat fw_stat;
+
+	fw_fd = open(img, O_RDONLY);
+	if (fw_fd < 0) {
+		ALOGE("Fail to open %s\n", img);
+              rc = -1;
+		goto ld_img_error;
+	}
+
+	rc = fstat(fw_fd, &fw_stat);
+	if (rc < 0) {
+		ALOGE("Cannot stat file %s: %s\n", img, strerror(errno));
+              rc = -1;
+		goto ld_img_error;
+	}
+
+	remaining = (int)fw_stat.st_size;
+
+	ALOGV("Firmware %s size %d\n", img, remaining);
+
+	if (remaining > sizeof(local_vpimg_buf)) {
+		ALOGE("File %s size %d exceeds internal limit %d\n",
+			 img, remaining, sizeof(local_vpimg_buf));
+              rc = -1;
+		goto ld_img_error;
+	}
+
+	while (remaining) {
+		nr = read(fw_fd, ptr, remaining);
+		if (nr < 0) {
+			ALOGE("Error reading firmware: %s\n", strerror(errno));
+                     rc=-1;
+			goto ld_img_error;
+		} else if (!nr) {
+			if (remaining)
+				ALOGV("EOF reading firmware %s while %d bytes remain\n",
+					 img, remaining);
+			break;
+		}
+		remaining -= nr;
+		ptr += nr;
+	}
+
+	close (fw_fd);
+	fw_fd = -1;
+
+	fwimg.buf = local_vpimg_buf;
+	fwimg.img_size = (int)(fw_stat.st_size - remaining);
+	ALOGV("voiceproc_uart_sendImg firmware Total %d bytes\n", fwimg.img_size);
+	i = 0;
+	write_size = 0;
+
+	while (i < fwimg.img_size) {
+		ret = write(uart_fd, fwimg.buf+i,
+			(fwimg.img_size - i) < BUFSIZE_UART ? (fwimg.img_size-i) : BUFSIZE_UART);
+		if (ret == -1)
+              {
+			ALOGV("Error, voiceproc uart write: %s\n", strerror(errno));
+                     rc = -1;
+                     goto ld_img_error;
+              }
+
+		write_size += ret;
+		i += BUFSIZE_UART;
+	}
+	if (write_size != fwimg.img_size)
+       {
+		ALOGE("Error, UART writeCnt %d != img_size %d\n", write_size, fwimg.img_size);
+              rc = -1;
+              goto ld_img_error;
+       }
+	else
+		ALOGV("UART writeCnt is %d verus img_size is %d\n", write_size, fwimg.img_size);
+
+ld_img_error:
+	if (fw_fd >= 0)
+		close(fw_fd);
+	return rc;
+}
+
+#define UART_INIT_IMAGE "/system/etc/firmware/voiceproc_init.img"
+#define UART_DEV_NAME "/dev/ttyHS2"
+int uart_load_binary(int fd, char *firmware_path)
+{
+    int ret = 0;
+    int uart_fd = 0;
+    int i;
+    int retry_count = 100;
+    struct termios options;
+    struct termios2 options2;
+
+    while (retry_count) {
+        ret = ioctl(fd, ES310_RESET_CMD);
+        if (!ret)
+            ALOGV("ES310: voiceproc_reset ES310_RESET_CMD OK\n");
+        else
+            ALOGE("ES310: voiceproc_reset ES310_RESET_CMD error %s\n", strerror(errno));
+
+        /* init uart port */
+        uart_fd = open(UART_DEV_NAME, O_RDWR | O_NOCTTY | O_NDELAY);
+        if (uart_fd < 0) {
+            ALOGE("fail to open uart port %s\n", UART_DEV_NAME);
+            return -1;
+        }
+        fcntl(uart_fd, F_SETFL, 0);
+
+        /* First stage download */
+        setHigherBaudrate(uart_fd, 28800);
+
+        /* reset voice processor */
+        usleep(10000);
+
+        ret = sendDownloadCmd(uart_fd);
+        if (ret) {
+            ALOGE("error sending 1st download command on 1st stage\n");
+            retry_count--;
+            close(uart_fd);
+            continue;
+        }
+
+        uartSendBinaryFile(uart_fd, UART_INIT_IMAGE);
+        ALOGV("Send init image done\n");
+
+        /* Second stage download */
+        if (tcgetattr(uart_fd, &options) < 0) {
+            ALOGE("Can't get port settings\n");
+            retry_count--;
+            close(uart_fd);
+            continue;
+        } else if (tcsetattr(uart_fd, TCSADRAIN, &options) < 0) {
+            ALOGE("Can't set port settings\n");
+            retry_count--;
+            close(uart_fd);
+            continue;
+        }
+        if (ioctl(uart_fd, TCGETS2, &options2) < 0) {
+            ALOGE("Can't get port settings 2\n");
+            retry_count--;
+            close(uart_fd);
+            continue;
+        } else {
+            options2.c_cflag &= ~CBAUD;
+            options2.c_cflag |= BOTHER;
+            options2.c_ospeed = 3000000;
+            options2.c_ispeed = 3000000;
+            if (ioctl(uart_fd, TCSETS2, &options2) < 0) {
+                ALOGE("Can't set port settings 2\n");
+                retry_count--;
+                close(uart_fd);
+                continue;
+            }
+        }
+
+        usleep(10000);
+        ret = sendDownloadCmd(uart_fd);
+        if (ret) {
+            ALOGE("ES310: error sending download command, abort. \n");
+            ALOGE("ES310: retry_count:%d", 100 - retry_count);
+            retry_count--;
+            close(uart_fd);
+            continue;
+        } else {
+            ALOGV("ES310: init send command done");
+            break;
+        }
+    }
+
+    if (ret) {
+        ALOGE("ES310: initial codec command error");
+        ret = -1;
+        goto ERROR;
+    }
+
+    usleep(1000);
+    ret = uartSendBinaryFile(uart_fd, firmware_path);
+
+ERROR:
+    close(uart_fd);
+
+    return ret;
+}
+
+void *AudioHardwareALSA::CSDInitThreadWrapper(void *me) {
+    ALOGV("AudioHardwareALSA::CSDInitThread+");
+    csd_client_init();
+    ALOGV("AudioHardwareALSA::CSDInitThread-");
+    return NULL;
+}
+
+void *AudioHardwareALSA::AudienceThreadWrapper(void *me) {
+    static_cast<AudioHardwareALSA *>(me)->AudienceThreadEntry();
+    return NULL;
+}
+
+void AudioHardwareALSA::AudienceThreadEntry() {
+    ALOGV("AudioHardwareALSA::AudienceThreadEntry +");
+    pid_t tid  = gettid();
+    int err;
+    androidSetThreadPriority(tid, ANDROID_PRIORITY_AUDIO);
+    mAudienceCmd = CMD_AUDIENCE_READY;
+    while(!mKillAudienceThread) {
+        switch (mAudienceCmd)
+        {
+            case CMD_AUDIENCE_WAKEUP:
+            {
+                ALOGV("AudioHardwareALSA::AudienceThreadEntry, doAudienceCodec_Wakeup");
+                err = doAudienceCodec_Wakeup();
+                if (err < 0) {
+                    ALOGE("doAudienceCodec_Wakeup: error %d\n", err);
+                }
+                break;
+            }
+            default:
+                mAudienceCmd = CMD_AUDIENCE_READY;
+        }
+        mAudienceCmd = CMD_AUDIENCE_READY;
+        pthread_mutex_lock(&mAudienceMutex);
+        pthread_cond_wait(&mAudienceCV, &mAudienceMutex);
+        pthread_mutex_unlock(&mAudienceMutex);
+        ALOGV("Audience command:%d", mAudienceCmd);
+        continue;
+    }
+    ALOGV("ALSADevice::csdThreadEntry -");
+}
+
+status_t AudioHardwareALSA::doAudienceCodec_Init(void)
+{
+    int fd_codec = -1;
+    int rc = 0;
+    int Audio_path = ES310_PATH_SUSPEND;
+    int retry_count = 20;
+    static const char *const path = "/dev/audience_es310";
+
+    fd_codec = open("/dev/audience_es310", O_RDWR | O_NONBLOCK, 0);
+
+    if (fd_codec < 0) {
+        ALOGE("Cannot open %s %d.\n", path, fd_codec);
+            return fd_codec;
+    }
+
+    while(retry_count)
+    {
+        ALOGV("start loading the voiceproc.img file, retry:%d +", 20 - retry_count);
+        ALOGV("set codec reset command");
+        rc = uart_load_binary(fd_codec, "/etc/firmware/voiceproc.img");
+        if (rc != 0)
+        {
+            ALOGE("uart_load_binary fail, rc:%d", rc);
+            retry_count--;
+            continue;
+        }
+        ALOGV("start loading the voiceproc.img file -");
+        usleep(11000);
+        ALOGV("ES310 SYNC CMD +");
+        rc = ioctl(fd_codec, ES310_SYNC_CMD, NULL);
+        ALOGV("ES310 SYNC CMD, rc:%d-", rc);
+        if (rc != 0)
+        {
+            ALOGE("ES310 SYNC CMD fail, rc:%d", rc);
+            retry_count--;
+            continue;
+        }
+
+        if (rc == 0)
+            break;
+    }
+
+    pthread_mutex_init(&mAudienceMutex, NULL);
+    pthread_cond_init (&mAudienceCV, NULL);
+    mKillAudienceThread = false;
+    mAudienceCmd = CMD_AUDIENCE_READY;
+    ALOGV("Creating Audience Thread");
+    pthread_create(&AudienceThread, NULL, AudienceThreadWrapper, this);
+
+    if (rc == 0) {
+        ALOGV("audience codec init OK\n");
+        mAudienceCodecInit = 1;
+    } else
+        ALOGE("audience codec init failed\n");
+
+    close(fd_codec);
+    return rc;
+}
+
+status_t AudioHardwareALSA::doAudienceCodec_DeInit(void)
+{
+    mKillAudienceThread = true;
+    pthread_cond_signal(&mAudienceCV);
+    pthread_join(AudienceThread,NULL);
+    ALOGV("Audience Thread Killed");
+    return 0;
+}
+
+status_t AudioHardwareALSA::doAudienceCodec_Wakeup()
+{
+    int fd_codec = -1;
+    int retry = 4;
+    int rc = 0;
+    ALOGV("Pre Wakeup Audience Codec ++");
+    Mutex::Autolock lock(mAudioCodecLock);
+    if (fd_codec < 0) {
+        fd_codec = open("/dev/audience_es310", O_RDWR);
+        if (fd_codec < 0) {
+            ALOGE("Cannot open either audience_es310 device (%d)\n", fd_codec);
+            return -1;
+        }
+    }
+
+    retry = 4;
+    do {
+        ALOGV("ioctl ES310_SET_CONFIG retry:%d", 4-retry);
+        rc = ioctl(fd_codec, ES310_WAKEUP_CMD, NULL);
+        if (rc == 0) {
+            break;
+        }
+        else {
+            ALOGE("ERROR: ES310_SET_CONFIG rc=%d", rc);
+        }
+    } while (--retry);
+
+    close(fd_codec);
+    fd_codec = -1;
+
+    ALOGV("Pre Wakeup Audience Codec --");
+    return rc;
+}
+
+status_t AudioHardwareALSA::doRouting_Audience_Codec(int mode, int device, bool enable)
+{
+    int rc = 0;
+    int retry = 4;
+    int fd_codec = -1;
+    bool bVideoRecord_NS = false;
+    bool bPresetAgain = false;
+    bool bForcePathAgain = false;
+    bool bVRMode = false;
+    char cVRMode[255]="0";
+    char cVNRMode[255]="2";
+    int VNRMode = 2;
+
+    if (mAudienceCodecInit != 1) {
+        ALOGE("Audience Codec not initialized.\n");
+        return -1;
+    }
+
+    ALOGD("doRouting_Audience_Codec mode:%d Routes:0x%x Enable:%d.\n", mode, device, enable);
+
+    Mutex::Autolock lock(mAudioCodecLock);
+    if ((mode < AudioSystem::MODE_CURRENT) || (mode >= AudioSystem::NUM_MODES)) {
+        ALOGW("Illegal value: doRouting_Audience_Codec(%d, 0x%x, %d)", mode, device, enable);
+        return -1;
+    }
+
+    if (enable == 0)
+    {
+        dwNewPath = ES310_PATH_SUSPEND;
+        goto ROUTE;
+    }
+
+    if (((device & AUDIO_DEVICE_IN_ALL) == 0) &&
+        ((device & AUDIO_DEVICE_OUT_ALL) != 0) &&
+        (mode == AudioSystem::MODE_NORMAL))
+    {
+        ALOGV("doRouting_Audience_Codec: Normal mode, RX no routing\n");
+        return 0;
+    }
+
+    property_get("audio.record.vrmode",cVRMode,"0");
+    if (!strncmp("1", cVRMode, 1)) {
+        bVRMode = 1;
+    } else {
+        bVRMode = 0;
+    }
+
+    property_get("persist.audio.vns.mode",cVNRMode,"2");
+    if (!strncmp("1", cVNRMode, 1)) {
+        VNRMode = 1;
+    } else {
+        VNRMode = 2;
+    }
+
+    ALOGV("doRouting_Audience_Codec  -> VRMode:%d, VNRMode:%d", bVRMode, VNRMode);
+
+    if (mode == AudioSystem::MODE_IN_CALL ||
+         mode == AudioSystem::MODE_RINGTONE) {
+        switch (device & AudioSystem::DEVICE_OUT_ALL) {
+            case AudioSystem::DEVICE_OUT_EARPIECE:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_INCALL_NB;
+                 break;
+            case AudioSystem::DEVICE_OUT_SPEAKER:
+                 dwNewPath = ES310_PATH_HANDSFREE;
+                 dwNewPreset = ES310_PRESET_HANDSFREE_INCALL_NB;
+                 break;
+            case AudioSystem::DEVICE_OUT_WIRED_HEADSET:
+                 dwNewPath = ES310_PATH_HEADSET;
+                 dwNewPreset = ES310_PRESET_HEADSET_INCALL_NB;
+                 break;
+            case AudioSystem::DEVICE_OUT_WIRED_HEADPHONE:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_INCALL_NB;
+                 break;
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_SCO:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_INCALL_NB;
+                 break;
+            case AudioSystem::DEVICE_OUT_AUX_DIGITAL:
+            case AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET:
+            case AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET:
+                 dwNewPath = ES310_PATH_HEADSET;
+                 dwNewPreset = ES310_PRESET_HEADSET_INCALL_NB;
+                 break;
+            default:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_INCALL_NB;
+                 break;
+        }
+        goto ROUTE;
+    }
+    else if (mode == AudioSystem::MODE_IN_COMMUNICATION) {
+        switch (device & AudioSystem::DEVICE_OUT_ALL) {
+            case AudioSystem::DEVICE_OUT_EARPIECE:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_VOIP_WB;
+                 break;
+            case AudioSystem::DEVICE_OUT_SPEAKER:
+                 dwNewPath = ES310_PATH_HANDSFREE;
+                 dwNewPreset = ES310_PRESET_HANDSFREE_VOIP_WB;
+                 break;
+            case AudioSystem::DEVICE_OUT_WIRED_HEADSET:
+                 dwNewPath = ES310_PATH_HEADSET;
+                 dwNewPreset = ES310_PRESET_HEADSET_VOIP_WB;
+                 break;
+            case AudioSystem::DEVICE_OUT_WIRED_HEADPHONE:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_VOIP_WB;
+                 break;
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_SCO:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+            case AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_VOIP_WB;
+                 break;
+            case AudioSystem::DEVICE_OUT_AUX_DIGITAL:
+            case AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET:
+            case AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET:
+                 dwNewPath = ES310_PATH_HEADSET;
+                 dwNewPreset = ES310_PRESET_HEADSET_VOIP_WB;
+                 break;
+            default:
+                 dwNewPath = ES310_PATH_HANDSET;
+                 dwNewPreset = ES310_PRESET_HANDSET_VOIP_WB;
+                 break;
+        }
+        goto ROUTE;
+    }
+    else {
+        switch (device & AudioSystem::DEVICE_IN_ALL)
+        {
+                //TX
+                case AudioSystem::DEVICE_IN_COMMUNICATION:
+                     dwNewPath = ES310_PATH_HANDSFREE;
+                     dwNewPreset = ES310_PRESET_HANDSFREE_REC_WB;
+                     break;
+                case AudioSystem::DEVICE_IN_AMBIENT:
+                     dwNewPath = ES310_PATH_HANDSFREE;
+                     dwNewPreset = ES310_PRESET_HANDSFREE_REC_WB;
+                     break;
+                case AudioSystem::DEVICE_IN_BUILTIN_MIC:
+                     {
+                         dwNewPath = ES310_PATH_HANDSET;
+                         dwNewPreset = ES310_PRESET_ANALOG_BYPASS;
+                     }
+                     if (bVRMode)
+                     {
+                         dwNewPreset = ES310_PRESET_VOICE_RECOGNIZTION_WB;
+                     }
+                     break;
+                case AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET:
+                     dwNewPath = ES310_PATH_HEADSET;
+                     dwNewPreset = ES310_PRESET_HANDSFREE_REC_WB;
+                     break;
+                case AudioSystem::DEVICE_IN_WIRED_HEADSET:
+                     dwNewPath = ES310_PATH_HEADSET;
+                     dwNewPreset = ES310_PRESET_HEADSET_MIC_ANALOG_BYPASS;
+                     break;
+                case AudioSystem::DEVICE_IN_AUX_DIGITAL:
+                case AudioSystem::DEVICE_IN_VOICE_CALL:
+                case AudioSystem::DEVICE_IN_BACK_MIC:
+                     dwNewPath = ES310_PATH_HANDSET;
+                     dwNewPreset = ES310_PRESET_HANDSFREE_REC_WB;
+                     break;
+                default:
+                     dwNewPath = ES310_PATH_HANDSET;
+                     dwNewPreset = ES310_PRESET_HANDSFREE_REC_WB;
+                     break;
+        }
+    }
+
+ROUTE:
+
+    if (VNRMode == 1) {
+        ALOGE("Switch to 1-Mic Solution");
+        if (dwNewPreset == ES310_PRESET_HANDSET_INCALL_NB) {
+            dwNewPreset = ES310_PRESET_HANDSET_INCALL_NB_1MIC;
+        }
+        if (dwNewPreset == ES310_PRESET_HANDSET_VOIP_WB) {
+            dwNewPreset = ES310_PRESET_HANDSET_INCALL_VOIP_WB_1MIC;
+        }
+    }
+
+    ALOGV("doRouting_Audience_Codec: dwOldPath=%d, dwNewPath=%d, prevMode=%d, mode=%d",
+                dwOldPath, dwNewPath, AudiencePrevMode, mode);
+
+    if (AudiencePrevMode != mode)
+    {
+        bForcePathAgain = true;
+        AudiencePrevMode = mode;
+    }
+
+    if (bForcePathAgain ||
+        (dwOldPath != dwNewPath) ||
+        (dwOldPreset != dwNewPreset)) {
+
+        if (fd_codec < 0) {
+            fd_codec = open("/dev/audience_es310", O_RDWR);
+            if (fd_codec < 0) {
+                ALOGE("Cannot open either audience_es310 device (%d)\n", fd_codec);
+                return -1;
+            }
+        }
+
+        if (bForcePathAgain ||
+            (dwOldPath != dwNewPath)) {
+            bPresetAgain = true;
+            retry = 4;
+            do {
+                ALOGV("ioctl ES310_SET_CONFIG newPath:%d, retry:%d", dwNewPath, (4-retry));
+                rc = ioctl(fd_codec, ES310_SET_CONFIG, &dwNewPath);
+
+                if (rc == 0) {
+                    dwOldPath = dwNewPath;
+                    break;
+                }
+                else
+                {
+                    ALOGE("ERROR: ES310_SET_CONFIG rc=%d", rc);
+                }
+            } while (--retry);
+            /*Close driver first incase we need to do audience HW reset when ES310_SET_CONFIG failed.*/
+        }
+
+        if (bPresetAgain)
+            ALOGV("doRouting_Audience_Codec: dwOldPreset:%s, dwNewPreset:%s", getNameByPresetID(dwOldPreset), getNameByPresetID(dwNewPreset));
+
+        if (bPresetAgain && (dwNewPath != ES310_PATH_SUSPEND)) {
+            retry = 4;
+            do {
+                ALOGV("ioctl ES310_SET_PRESET newPreset:0x%x, retry:%d", dwNewPreset, (4-retry));
+                rc = ioctl(fd_codec, ES310_SET_PRESET, &dwNewPreset);
+
+                if (rc == 0) {
+                    dwOldPreset = dwNewPreset;
+                    break;
+                }
+                else
+                {
+                    ALOGE("ERROR: ES310_SET_PRESET rc=%d", rc);
+                }
+            } while (--retry);
+            /*Close driver first incase we need to do audience HW reset when ES310_SET_CONFIG failed.*/
+        }
+
+        close(fd_codec);
+        fd_codec = -1;
+
+RECOVER:
+        if (rc < 0) {
+            ALOGE("E310 do hard reset to recover from error!\n");
+            rc = doAudienceCodec_Init(); /* A1026 needs to do hard reset! */
+            if (!rc) {
+                fd_codec = open("/dev/audience_es310", O_RDWR);
+                if (fd_codec >= 0) {
+                    rc = ioctl(fd_codec, ES310_SET_CONFIG, &dwNewPath);
+                    if (rc == NO_ERROR)
+                        dwOldPath = dwNewPath;
+                    else
+                        ALOGE("Audience Codec Fatal Error! rc %d\n", rc);
+                    close(fd_codec);
+                } else
+                    ALOGE("Audience Codec Fatal Error: Re-init Audience Codec open driver fail!! rc %d\n", fd_codec);
+            } else
+                ALOGE("Audience Codec Fatal Error: Re-init A1026 Failed. rc %d\n", rc);
+        }
+    }
+
+    return NO_ERROR;
+}
+char* AudioHardwareALSA::getNameByPresetID(int presetID)
+{
+     switch(presetID){
+        case ES310_PRESET_HANDSET_INCALL_NB:
+              return "ES310_PRESET_HANDSET_INCALL_NB";
+        case ES310_PRESET_HEADSET_INCALL_NB:
+              return "ES310_PRESET_HEADSET_INCALL_NB";
+        case ES310_PRESET_HANDSET_INCALL_NB_1MIC:
+              return "ES310_PRESET_HANDSET_INCALL_NB_1MIC";
+        case ES310_PRESET_HANDSFREE_INCALL_NB:
+              return "ES310_PRESET_HANDSFREE_INCALL_NB";
+        case ES310_PRESET_HANDSET_INCALL_WB:
+              return "ES310_PRESET_HANDSET_INCALL_WB";
+        case ES310_PRESET_HEADSET_INCALL_WB:
+              return "ES310_PRESET_HEADSET_INCALL_WB";
+        case ES310_PRESET_AUDIOPATH_DISABLE:
+              return "ES310_PRESET_AUDIOPATH_DISABLE";
+        case ES310_PRESET_HANDSFREE_INCALL_WB:
+              return "ES310_PRESET_HANDSFREE_INCALL_WB";
+        case ES310_PRESET_HANDSET_VOIP_WB:
+              return "ES310_PRESET_HANDSET_VOIP_WB";
+        case ES310_PRESET_HEADSET_VOIP_WB:
+              return "ES310_PRESET_HEADSET_VOIP_WB";
+        case ES310_PRESET_HANDSFREE_REC_WB:
+              return "ES310_PRESET_HANDSFREE_REC_WB";
+        case ES310_PRESET_HANDSFREE_VOIP_WB:
+              return "ES310_PRESET_HANDSFREE_VOIP_WB";
+        case ES310_PRESET_VOICE_RECOGNIZTION_WB:
+              return "ES310_PRESET_VOICE_RECOGNIZTION_WB";
+        case ES310_PRESET_HANDSET_INCALL_VOIP_WB_1MIC:
+              return "ES310_PRESET_HANDSET_INCALL_VOIP_WB_1MIC";
+        case ES310_PRESET_ANALOG_BYPASS:
+              return "ES310_PRESET_ANALOG_BYPASS";
+        case ES310_PRESET_HEADSET_MIC_ANALOG_BYPASS:
+              return "ES310_PRESET_HEADSET_MIC_ANALOG_BYPASS";
+        default:
+            return "Unknown";
+     }
+     return "Unknown";
+}
+#endif
 
 status_t AudioHardwareALSA::setMicMute(bool state)
 {

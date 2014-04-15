@@ -127,6 +127,10 @@ extern "C" {
 #define SND_USE_CASE_DEV_DOCK		"Dock"
 /* add new devices to end of list */
 
+#if defined(USE_ES310) || defined(TAURUS)
+#undef SND_USE_CASE_DEV_HEADSET
+#define SND_USE_CASE_DEV_HEADSET       "HeadsetMic TX"
+#endif
 
 /*
  * Use Case Modifiers.

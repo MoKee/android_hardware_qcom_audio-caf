@@ -117,6 +117,14 @@ ifeq ($(BOARD_HAVE_SAMSUNG_AUDIO),true)
     common_cflags += -DSAMSUNG_AUDIO
 endif
 
+ifeq ($(BOARD_HAVE_AUDIENCE_ES310),true)
+    common_cflags += -DUSE_ES310
+endif
+
+ifeq ($(TARGET_BOOTLOADER_BOARD_NAME),taurus)
+    common_cflags += -DTAURUS
+endif
+
 ifeq ($(BOARD_HAVE_NEW_QCOM_CSDCLIENT),true)
     common_cflags += -DNEW_CSDCLIENT
 endif
