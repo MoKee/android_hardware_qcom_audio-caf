@@ -1966,7 +1966,7 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
 #endif
 
 #if defined(USE_ES310) || defined(TAURUS)
-                return strdup(SND_USE_CASE_DEV_VOC_EARPIECE); 
+                return strdup(SND_USE_CASE_DEV_VOC_EARPIECE);
 #else
                 if (shouldUseHandsetAnc(mDevSettingsFlag, mInChannels)) {
                     return strdup(SND_USE_CASE_DEV_ANC_HANDSET); /* ANC Handset RX */
@@ -2217,30 +2217,30 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
                 else {
 
 #ifdef TAURUS
-                    if (mCallMode == AudioSystem::MODE_IN_CALL ||
-                         mCallMode == AudioSystem::MODE_IN_COMMUNICATION) {
-                        if (((rxDevice != NULL) &&
-                            !strncmp(rxDevice, SND_USE_CASE_DEV_VOC_EARPIECE,
-                            (strlen(SND_USE_CASE_DEV_VOC_EARPIECE)+1))) ||
-                            ((rxDevice == NULL) &&
-                            !strncmp(mCurRxUCMDevice, SND_USE_CASE_DEV_VOC_EARPIECE,
-                            (strlen(SND_USE_CASE_DEV_VOC_EARPIECE)+1)))) {
-                            ALOGE("Phone call Receiver mode - dual MIC");
-                            return strdup(SND_USE_CASE_DEV_DUAL_MIC_ENDFIRE); /* BUILTIN-MIC TX */
-                        } else {
-                            ALOGE("Phone call Speaker mode - Back Mic Voice ");
-                            return strdup(SND_USE_CASE_DEV_VOC_LINE_BACK); /* BUILTIN-MIC TX */
-                        }
+                if (mCallMode == AudioSystem::MODE_IN_CALL ||
+                    mCallMode == AudioSystem::MODE_IN_COMMUNICATION) {
+                    if (((rxDevice != NULL) &&
+                        !strncmp(rxDevice, SND_USE_CASE_DEV_VOC_EARPIECE,
+                        (strlen(SND_USE_CASE_DEV_VOC_EARPIECE)+1))) ||
+                        ((rxDevice == NULL) &&
+                        !strncmp(mCurRxUCMDevice, SND_USE_CASE_DEV_VOC_EARPIECE,
+                        (strlen(SND_USE_CASE_DEV_VOC_EARPIECE)+1)))) {
+                        ALOGE("Phone call Receiver mode - dual MIC");
+                        return strdup(SND_USE_CASE_DEV_DUAL_MIC_ENDFIRE); /* BUILTIN-MIC TX */
                     } else {
-                        return strdup(SND_USE_CASE_DEV_LINE_MAIN); /* MAIN-MIC TX */
+                        ALOGE("Phone call Speaker mode - Back Mic Voice ");
+                        return strdup(SND_USE_CASE_DEV_VOC_LINE_BACK); /* BUILTIN-MIC TX */
                     }
+                } else {
+                    return strdup(SND_USE_CASE_DEV_LINE_MAIN); /* MAIN-MIC TX */
+                }
 #endif
 #ifdef USE_ES310
-					if (mCallMode == AUDIO_MODE_IN_CALL) {
-						return strdup(SND_USE_CASE_DEV_VOC_LINE); /* VOICE BUILTIN-MIC TX */
-					} else {
-						return strdup(SND_USE_CASE_DEV_LINE); /* BUILTIN-MIC TX */
-					}
+                if (mCallMode == AUDIO_MODE_IN_CALL) {
+                    return strdup(SND_USE_CASE_DEV_VOC_LINE); /* VOICE BUILTIN-MIC TX */
+                } else {
+                    return strdup(SND_USE_CASE_DEV_LINE); /* BUILTIN-MIC TX */
+                }
 #endif
 
                     if ((rxDevice != NULL) &&
