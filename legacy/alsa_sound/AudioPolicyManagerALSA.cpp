@@ -344,7 +344,6 @@ status_t AudioPolicyManager::setDeviceConnectionState(audio_devices_t device,
             }
 
             ALOGV("setDeviceConnectionState() disconnecting device %x", device);
-            mForceDeviceChange = true;
             // remove device from available output devices
             mAvailableOutputDevices = (audio_devices_t)(mAvailableOutputDevices & ~device);
 
@@ -378,6 +377,7 @@ status_t AudioPolicyManager::setDeviceConnectionState(audio_devices_t device,
             return BAD_VALUE;
         }
 
+        mForceDeviceChange = true;
         checkA2dpSuspend();
         checkOutputForAllStrategies();
         // outputs must be closed after checkOutputForAllStrategies() is executed
@@ -1850,8 +1850,9 @@ uint32_t AudioPolicyManager::setOutputDevice(audio_io_handle_t output,
     //this, update mDevice even if device is 0 which triggers routing when
     // HDMI cable/usb hs is reconnected
     if (device != AUDIO_DEVICE_NONE ||
-        prevDevice == AUDIO_DEVICE_OUT_AUX_DIGITAL ||
-        prevDevice == AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET) {
+        ((prevDevice == AUDIO_DEVICE_OUT_AUX_DIGITAL ||
+          prevDevice == AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET) &&
+         mForceDeviceChange)) {
         outputDesc->mDevice = device;
     }
 
